@@ -1,0 +1,191 @@
+#----FIRST CELL-----
+
+from google.colab import drive
+import zipfile
+import os
+
+# 1. Connect to Google Drive
+print("Mounting Google Drive...")
+drive.mount('/content/drive')
+
+# 2. Unzip the dataset (Much faster than uploading folders)
+zip_path = '/content/drive/MyDrive/plant/plant_dataset.zip' # Make sure this matches your filename
+extract_path = '/content/dataset'
+
+if not os.path.exists(extract_path):
+    print("Unzipping dataset... (This might take 1-2 minutes)")
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_path)
+    print("✓ Unzip complete!")
+else:
+    print("✓ Dataset already unzipped.")
+
+# 3. Define the new DATA_DIR for Colab
+# IMPORTANT: Check the unzipped structure. It usually creates the folder name inside.
+# If your zip was 'color' -> it will be '/content/dataset/color'
+DATA_DIR = '/content/dataset/color'
+
+print(f"✓ Your data is ready at: {DATA_DIR}")
+# Re-running this cell to ensure environment setup after FileNotFoundError
+
+
+#---SECOND CELL-----
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.applications.efficientnet import preprocess_input
+import os
+import math
+import matplotlib.pyplot as plt
+import json
+import shutil # Added to help move files to Drive
+
+# ==========================================
+# 1. CONFIGURATION (UPDATED FOR COLAB)
+# ==========================================
+# This matches the output you just got:
+DATA_DIR = '/content/dataset/color'
+
+# We save the model locally in the VM first (faster)
+MODEL_FILENAME = 'EfficientNetB0_FineTuned.h5'
+TARGET_SIZE = (224, 224)
+BATCH_SIZE = 32
+
+# ==========================================
+# 2. DATA PREPARATION
+# ==========================================
+print("\n[1/6] Preparing Data Generators...")
+
+# Training Generator (Augmented)
+train_datagen = ImageDataGenerator(
+    preprocessing_function=preprocess_input,
+    rotation_range=40,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    fill_mode='nearest',
+    validation_split=0.2
+)
+
+# Validation Generator (Clean)
+val_datagen = ImageDataGenerator(
+    preprocessing_function=preprocess_input,
+    validation_split=0.2
+)
+
+train_generator = train_datagen.flow_from_directory(
+    DATA_DIR,
+    target_size=TARGET_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    subset='training',
+    seed=42
+)
+
+validation_generator = val_datagen.flow_from_directory(
+    DATA_DIR,
+    target_size=TARGET_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    subset='validation',
+    seed=42
+)
+
+NUM_CLASSES = len(train_generator.class_indices)
+print(f"✓ Found {NUM_CLASSES} classes.")
+
+# Save class names
+with open('class_names.json', 'w') as f:
+    json.dump({'class_names': list(train_generator.class_indices.keys())}, f)
+
+# ==========================================
+# 3. MODEL ARCHITECTURE (EfficientNetB0)
+# ==========================================
+print("\n[2/6] Building Model...")
+
+base_model = EfficientNetB0(
+    weights='imagenet',
+    include_top=False,
+    input_shape=(224, 224, 3)
+)
+
+base_model.trainable = False # Freeze base for Stage 1
+
+inputs = keras.Input(shape=(224, 224, 3))
+x = base_model(inputs, training=False) # Important: Keep BatchNorm frozen
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.2)(x)
+outputs = layers.Dense(NUM_CLASSES, activation='softmax')(x)
+
+model = keras.Model(inputs, outputs)
+
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=0.0001),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+# ==========================================
+# 4. TRAINING STAGE 1 (Head Only)
+# ==========================================
+print("\n[3/6] STAGE 1: Training Head...")
+
+callbacks = [
+    ModelCheckpoint(MODEL_FILENAME, save_best_only=True, monitor='val_loss', verbose=1),
+    EarlyStopping(patience=5, restore_best_weights=True, verbose=1)
+]
+
+history = model.fit(
+    train_generator,
+    validation_data=validation_generator,
+    epochs=10, 
+    callbacks=callbacks
+)
+
+# ==========================================
+# 5. TRAINING STAGE 2 (Fine-Tuning)
+# ==========================================
+print("\n[4/6] STAGE 2: Fine-Tuning...")
+
+base_model.trainable = True
+
+# Freeze the first 100 layers (keep them stable)
+for layer in base_model.layers[:-100]:
+    layer.trainable = False
+
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=1e-5), # Low LR is critical
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+history_fine = model.fit(
+    train_generator,
+    validation_data=validation_generator,
+    epochs=15, 
+    callbacks=callbacks
+)
+
+# ==========================================
+# 6. SAVE TO GOOGLE DRIVE (CRITICAL STEP)
+# ==========================================
+print("\n[5/6] Saving Final Model to Google Drive...")
+
+# Define destination on Google Drive
+drive_path = '/content/drive/MyDrive/Plant_Disease_Model_Final.h5'
+class_names_path = '/content/drive/MyDrive/class_names.json'
+
+# Copy the file from Colab VM to Drive
+shutil.copy(MODEL_FILENAME, drive_path)
+shutil.copy('class_names.json', class_names_path)
+
+print(f"✓ SUCCESS! Model saved permanently to: {drive_path}")
+print(f"✓ Class names saved to: {class_names_path}")
+print("You can now close this tab without losing your work.")
